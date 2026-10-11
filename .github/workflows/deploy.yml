@@ -1,0 +1,148 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  # Deploy jobs are skipped until the repository variables from `terraform output` are set
+  # (see README "Deploying to AWS"), so forks and fresh clones still get a green CI run.
+  api:
+    name: Deploy API to ECS Fargate
+    needs: test
+    if: vars.AWS_DEPLOY_ROLE_ARN != ''
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_TASK_FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: image
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker build -t "$IMAGE" backend
+          docker push "$IMAGE"
+          echo "uri=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Register task definition
+        id: taskdef
+        env:
+          IMAGE: ${{ steps.image.outputs.uri }}
+        run: |
+          aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition \
+            | jq --arg img "$IMAGE" '
+                .containerDefinitions[0].image = $img
+                | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                      .compatibilities, .registeredAt, .registeredBy)' > taskdef.json
+          arn=$(aws ecs register-task-definition --cli-input-json file://taskdef.json \
+            --query taskDefinition.taskDefinitionArn --output text)
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+
+      # Migrations run once, as a one-off task with the new image, before any new API task
+      # starts. If they fail, the service keeps running the previous revision.
+      - name: Run database migrations
+        env:
+          TASK_DEF: ${{ steps.taskdef.outputs.arn }}
+          SUBNETS: ${{ vars.ECS_SUBNETS }}
+          SECURITY_GROUP: ${{ vars.ECS_SECURITY_GROUP }}
+        run: |
+          task=$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_DEF" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"api","command":["alembic","upgrade","head"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          echo "Migration task: $task"
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$task"
+          code=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "$code" != "0" ]; then
+            echo "::error::Migrations failed (exit code $code). Check /ecs logs in CloudWatch."
+            exit 1
+          fi
+
+      - name: Roll out new revision
+        env:
+          TASK_DEF: ${{ steps.taskdef.outputs.arn }}
+        run: |
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEF" > /dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Smoke test
+        if: vars.APP_URL != ''
+        run: |
+          curl -fsS --retry 5 --retry-delay 5 "${{ vars.APP_URL }}/api/v1/sandbox/payment-methods" > /dev/null
+          curl -fsS -X POST "${{ vars.APP_URL }}/api/v1/quotes" -H 'Content-Type: application/json' \
+            -d '{"principal":"100.00","installment_count":4}'
+
+  web:
+    name: Deploy frontend to S3 + CloudFront
+    # After the API, so a new UI never talks to an old API.
+    needs: api
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload to S3
+        env:
+          BUCKET: ${{ vars.WEB_BUCKET }}
+        run: |
+          # Hashed assets are immutable; index.html must always be revalidated.
+          aws s3 sync dist "s3://$BUCKET" --delete --exclude index.html \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp dist/index.html "s3://$BUCKET/index.html" \
+            --cache-control "no-cache" --content-type "text/html; charset=utf-8"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" --paths /index.html

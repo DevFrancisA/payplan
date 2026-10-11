@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+junit.xml
+.env
+
+# Node
+node_modules/
+dist/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+backend.hcl
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

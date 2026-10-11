@@ -1,0 +1,45 @@
+# Local development: `docker compose up --build`, then `npm run dev` in frontend/.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payplan
+      POSTGRES_PASSWORD: payplan
+      POSTGRES_DB: payplan
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payplan"]
+      interval: 2s
+      retries: 20
+
+  # Throwaway database for pytest (tests/conftest.py connects to localhost:5433).
+  db-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payplan
+      POSTGRES_PASSWORD: payplan
+      POSTGRES_DB: payplan_test
+    ports: ["5433:5432"]
+    tmpfs: [/var/lib/postgresql/data]
+    profiles: [test]
+
+  migrate:
+    build: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      PAYPLAN_DATABASE_URL: postgresql+psycopg://payplan:payplan@db:5432/payplan
+    depends_on:
+      db: { condition: service_healthy }
+
+  api:
+    build: ./backend
+    environment:
+      PAYPLAN_DATABASE_URL: postgresql+psycopg://payplan:payplan@db:5432/payplan
+      PAYPLAN_CORS_ORIGINS: '["http://localhost:5173"]'
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
